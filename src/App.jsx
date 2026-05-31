@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 
 /* ============================================================
    KELLY DESK — simultaneous binary-contract bankroll manager
@@ -135,7 +135,6 @@ export default function KellyDesk() {
     { id: "c", name: "Contract C", cost: "0.25", prob: "0.50" },
   ]);
   const [loaded, setLoaded] = useState(false);
-  const [sim, setSim] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -222,29 +221,52 @@ export default function KellyDesk() {
     return { staked, ev, cash: bankroll - staked };
   }, [calc, bankroll]);
 
-  // Monte Carlo over simultaneous rounds
-  const runSim = useCallback(() => {
-    if (items.length === 0) { setSim({ error: "No positive-edge contracts to simulate." }); return; }
-    const TRIALS = 4000, STEPS = 400;
-    let ruined = 0; const finals = [];
-    for (let t = 0; t < TRIALS; t++) {
-      let w = 1, minW = 1;
-      for (let s = 0; s < STEPS; s++) {
-        let M = 1;
-        for (let i = 0; i < items.length; i++) {
-          const win = Math.random() < items[i].p;
-          M += win ? alloc[i] * items[i].b : -alloc[i];
-        }
-        w *= M;
-        if (w < minW) minW = w;
-        if (w < 1e-9) break;
+  // exact single-round outcome enumeration over all 2ⁿ joint win/lose combos
+  const TOP_ROWS = 30;
+  const outcomes = useMemo(() => {
+    const n = items.length;
+    if (n === 0) return { list: [], belowProb: 0, n: 0, minMult: 0, maxMult: 0 };
+    const N = 1 << n;
+    const list = new Array(N);
+    let belowProb = 0, minMult = Infinity, maxMult = -Infinity;
+    for (let s = 0; s < N; s++) {
+      let pr = 1, M = 1;
+      for (let i = 0; i < n; i++) {
+        const w = (s & (1 << i)) !== 0;
+        pr *= w ? items[i].p : 1 - items[i].p;
+        M += w ? alloc[i] * items[i].b : -alloc[i];
       }
-      if (minW <= alpha) ruined++;
-      finals.push(w);
+      list[s] = { mask: s, prob: pr, mult: M };
+      if (M < alpha) belowProb += pr;
+      if (M < minMult) minMult = M;
+      if (M > maxMult) maxMult = M;
     }
-    finals.sort((a, b) => a - b);
-    setSim({ empirical: ruined / TRIALS, theory: risk, median: finals[(TRIALS / 2) | 0], steps: STEPS, trials: TRIALS });
-  }, [items, alloc, alpha, risk]);
+    return { list, belowProb, n, minMult, maxMult };
+  }, [items, alloc, alpha]);
+
+  // top outcomes by probability for the table (full 2ⁿ list is too large to render)
+  const topOutcomes = useMemo(
+    () => [...outcomes.list].sort((a, b) => b.prob - a.prob).slice(0, TOP_ROWS),
+    [outcomes]
+  );
+  const topProb = topOutcomes.reduce((s, o) => s + o.prob, 0);
+
+  // probability-weighted end-value distribution, binned by multiplier
+  const histo = useMemo(() => {
+    const BINS = 28;
+    if (outcomes.n === 0) return { bins: [], maxP: 0, lo: 0, hi: 1, alphaPos: 0 };
+    let lo = outcomes.minMult, hi = outcomes.maxMult;
+    if (hi - lo < 1e-9) { lo -= 0.01; hi += 0.01; }
+    const width = (hi - lo) / BINS;
+    const bins = Array.from({ length: BINS }, (_, k) => ({ x0: lo + k * width, x1: lo + (k + 1) * width, p: 0 }));
+    for (const o of outcomes.list) {
+      let k = Math.floor((o.mult - lo) / width);
+      if (k < 0) k = 0; else if (k >= BINS) k = BINS - 1;
+      bins[k].p += o.prob;
+    }
+    const maxP = bins.reduce((m, b) => Math.max(m, b.p), 0);
+    return { bins, maxP, lo, hi, alphaPos: clamp((alpha - lo) / (hi - lo), 0, 1) };
+  }, [outcomes, alpha]);
 
   const updateRow = (id, field, val) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, [field]: val } : r)));
   const addRow = () => setRows((rs) => [...rs, blank("Contract " + String.fromCharCode(65 + rs.length))]);
@@ -374,17 +396,59 @@ export default function KellyDesk() {
       </section>
 
       <section className="kd-card">
-        <div className="kd-card-h kd-th-row"><span>MONTE CARLO CHECK</span><button className="kd-add" onClick={runSim}>▶ run 4,000 paths</button></div>
-        {sim ? (sim.error ? <div className="kd-note">{sim.error}</div> : (
-          <div className="kd-sim">
-            <Stat label="Empirical risk" value={fmtPct(sim.empirical, 1)} />
-            <Stat label="Theory α^(2m/v)" value={fmtPct(sim.theory, 1)} />
-            <Stat label="Median end (×start)" value={sim.median.toFixed(2) + "×"} accent="pos" />
-            <div className="kd-note" style={{ gridColumn: "1 / -1" }}>
-              {sim.trials.toLocaleString()} paths × {sim.steps} rounds; each round resolves all contracts simultaneously and independently at the current allocation. Finite-horizon, so empirical sits just under the infinite-horizon formula.
+        <div className="kd-card-h">EXACT SINGLE-ROUND OUTCOMES (2ⁿ ENUMERATION)</div>
+        {outcomes.n === 0 ? (
+          <div className="kd-note">Add positive-edge contracts to enumerate every possible outcome of one simultaneous round exactly.</div>
+        ) : (
+          <>
+            <div className="kd-bignum" style={{ color: outcomes.belowProb > 0.25 ? "#f85149" : outcomes.belowProb > 0.1 ? "#d29922" : "#3fb950" }}>
+              {fmtPct(outcomes.belowProb, 2)}
             </div>
-          </div>
-        )) : <div className="kd-note">Replays your portfolio over many simultaneous rounds and counts how often a path ever falls to {fmtPct(alpha, 0)} of its starting bankroll — a direct check on the joint formula.</div>}
+            <div className="kd-bignum-cap">
+              chance this single round ends below {fmtPct(alpha, 0)} of bankroll ({fmtMoney(alpha * bankroll)})
+            </div>
+            <svg viewBox="0 0 280 90" className="kd-histo" preserveAspectRatio="none">
+              {histo.bins.map((b, k) => {
+                const bw = 280 / histo.bins.length;
+                const h = histo.maxP > 0 ? (b.p / histo.maxP) * 88 : 0;
+                return <rect key={k} x={k * bw + 0.5} y={90 - h} width={Math.max(bw - 1, 0.5)} height={h}
+                  fill={b.x1 <= alpha ? "#f85149" : "#58a6ff"} opacity="0.85" />;
+              })}
+              <line x1={histo.alphaPos * 280} y1="0" x2={histo.alphaPos * 280} y2="90" stroke="#d29922" strokeWidth="1" strokeDasharray="3 2" />
+            </svg>
+            <div className="kd-curve-cap"><span>← lower end value</span><span>P-weighted end value · ↑ drawdown α</span></div>
+
+            <div className="kd-otable">
+              <div className="kd-otr kd-othead">
+                <span>Outcome (W/L per contract)</span><span>Probability</span><span>×bankroll</span><span>End value</span>
+              </div>
+              {topOutcomes.map((o) => {
+                const below = o.mult < alpha;
+                return (
+                  <div className={"kd-otr" + (below ? " kd-below" : "")} key={o.mask}>
+                    <span className="kd-wl">
+                      {items.map((it, i) => (
+                        <b key={i} className={(o.mask & (1 << i)) ? "w" : "l"}>{(o.mask & (1 << i)) ? "W" : "L"}</b>
+                      ))}
+                    </span>
+                    <span className="kd-cell">{fmtPct(o.prob, 2)}</span>
+                    <span className="kd-cell">{o.mult.toFixed(3)}×</span>
+                    <span className={"kd-cell " + (below ? "neg" : "")}>{fmtMoney(o.mult * bankroll)}</span>
+                  </div>
+                );
+              })}
+            </div>
+
+            {outcomes.list.length > TOP_ROWS && (
+              <div className="kd-note">
+                Showing top {TOP_ROWS} of {outcomes.list.length.toLocaleString()} outcomes by probability — the remaining {(outcomes.list.length - TOP_ROWS).toLocaleString()} account for {fmtPct(1 - topProb, 2)} of total probability.
+              </div>
+            )}
+            <div className="kd-note">
+              Every row resolves all {outcomes.n} contracts simultaneously and independently; W/L columns follow the contracts table order. Probabilities are exact and sum to 100% over all 2^{outcomes.n} = {outcomes.list.length.toLocaleString()} outcomes. Red marks outcomes finishing below the drawdown threshold.
+            </div>
+          </>
+        )}
       </section>
 
       <details className="kd-card kd-math">
@@ -469,7 +533,16 @@ const CSS = `
 .kd-del{background:none;border:none;color:#4a5568;font-size:16px;cursor:pointer;line-height:1;}
 .kd-del:hover{color:#f85149;}
 .kd-note{font-size:11px;color:#6b7785;line-height:1.5;margin-top:12px;}
-.kd-sim{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;}
+.kd-histo{width:100%;height:80px;margin:10px 0 0;}
+.kd-otable{font-family:'IBM Plex Mono',monospace;margin-top:14px;max-height:420px;overflow-y:auto;}
+.kd-otr{display:grid;grid-template-columns:2fr 1fr 1fr 1.1fr;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid #161b22;}
+.kd-othead{font-size:9.5px;color:#6b7785;letter-spacing:.5px;border-bottom:1px solid #2a3441;padding-bottom:8px;position:sticky;top:0;background:#0d1117;z-index:1;}
+.kd-othead span{text-align:right;} .kd-othead span:first-child{text-align:left;}
+.kd-otr.kd-below{background:#f8514910;}
+.kd-wl{display:flex;gap:3px;flex-wrap:wrap;}
+.kd-wl b{display:inline-flex;width:16px;height:16px;align-items:center;justify-content:center;border-radius:3px;font-size:9px;font-weight:600;}
+.kd-wl b.w{background:#3fb95022;color:#3fb950;}
+.kd-wl b.l{background:#f8514922;color:#f85149;}
 .kd-math{margin-top:14px;}
 .kd-math summary{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1px;color:#8b949e;cursor:pointer;}
 .kd-mathbody{font-size:13px;line-height:1.6;color:#c9d1d9;margin-top:12px;}
