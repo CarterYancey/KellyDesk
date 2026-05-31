@@ -177,22 +177,24 @@ Solving numerically: **f\* ≈ 0.249**. Total exposure ≈ 74.7%. The worst-case
 
 A fourth identical contract would cause the solver to redistribute to roughly 20% each, total ~80%, rather than exceeding any natural bound.
 
-### Solver Algorithm
+### Solver Algorithm 
 
-Kelly Desk uses **coordinate-wise Newton ascent** with incremental multiplier maintenance.
+Kelly Desk solves the joint optimization with **full-vector Newton's method**.
 
-The algorithm maintains the array *M*[*S*] for all 2ⁿ outcomes. For each coordinate *i*, it computes the exact gradient and second derivative of *G* with respect to *fᵢ* (holding all others fixed):
+A key structural fact makes this clean: every positive-edge contract receives a strictly positive allocation at the optimum. The marginal log-growth of adding the *i*-th contract starting from zero is *E*[*aᵢ*] · *E*[1/*M₋ᵢ*], where *E*[*aᵢ*] = (*pᵢ* − *cᵢ*)/*cᵢ* > 0 for positive edge. So the non-negativity constraints *fᵢ* ≥ 0 are never active at the optimum — the solution is interior — and the only constraint the algorithm must actively respect is the barrier *M*(*S*) > 0 for all outcomes.
+
+Each Newton iteration computes the exact gradient and Hessian over all 2ⁿ outcomes:
 
 ```
-G'(fᵢ)  = Σ_S P(S) · aᵢ(S) / M(S)
-G''(fᵢ) = −Σ_S P(S) · aᵢ(S)² / M(S)²
+gradᵢ  = Σ_S P(S) · aᵢ(S) / M(S)
+Hᵢⱼ    = −Σ_S P(S) · aᵢ(S)·aⱼ(S) / M(S)²
 ```
 
-where *aᵢ*(*S*) = *bᵢ* if *i* ∈ *S* (contract wins), −1 otherwise (contract loses). The Newton step *Δ = −G'/G''* is then clamped to keep all *M*(*S*) > 0 and *fᵢ* ≥ 0. When *fᵢ* changes by *Δ*, every *M*(*S*) is updated in O(2ⁿ) time by adding *aᵢ*(*S*)·*Δ*.
+where *aᵢ*(*S*) = *bᵢ* if contract *i* wins in outcome *S*, else −1. The Hessian *H* is negative definite (the objective is strictly concave), so the step **δ** solving *H*δ = −**grad** is an ascent direction. A backtracking line search along **δ** shrinks the step until it both preserves feasibility (all *M*(*S*) > 0, all *fᵢ* ≥ 0) and satisfies an Armijo sufficient-increase condition. A tiny diagonal damping term guards against ill-conditioning when the optimum sits near the boundary (which happens with strong edges, where total exposure approaches 100%).
 
-The algorithm sweeps all coordinates to convergence. The full objective is strictly concave — since log is concave and *M*(*S*) is linear in *f* — so coordinate ascent converges to the global optimum.
+Newton's method converges quadratically and — critically — respects the symmetry of the problem: identical contracts always receive identical allocations, and the solution is independent of the order in which contracts are entered. (An earlier coordinate-by-coordinate optimizer failed this test, producing order-dependent, lopsided splits when edges were strong; full-vector Newton resolves it.)
 
-**Computational note.** Exact enumeration of 2ⁿ outcomes is tractable up to *n* ≈ 16 contracts (65,536 outcomes) in the browser. The tool caps the joint solver at 16 positive-edge contracts. In practice, portfolios of that size are common; beyond it you would want a Monte Carlo gradient estimator.
+**Computational note.** Exact enumeration of 2ⁿ outcomes plus an *n* × *n* Hessian is tractable up to *n* ≈ 16 positive-edge contracts in the browser, the cap the tool enforces. The solver re-runs only when the contract set changes. Beyond 16 contracts, a Monte Carlo gradient/Hessian estimator would be the natural extension.
 
 ---
 

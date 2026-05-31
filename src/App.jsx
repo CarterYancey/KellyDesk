@@ -22,59 +22,93 @@ const fmtPct = (x, d = 1) => (x * 100).toFixed(d) + "%";
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 const MAX_N = 16; // exact 2ⁿ enumeration cap
 
-// ---- joint full-Kelly solver (coordinate-wise Newton ascent) ----
+// ---- joint full-Kelly solver (full-vector Newton ascent) ----
 function solveJointKelly(items) {
   const n = items.length;
   if (n === 0) return [];
   const N = 1 << n;
+  const b = items.map((it) => it.b);
   const prob = new Float64Array(N);
   for (let s = 0; s < N; s++) {
     let pr = 1;
     for (let i = 0; i < n; i++) pr *= s & (1 << i) ? items[i].p : 1 - items[i].p;
     prob[s] = pr;
   }
-  const f = new Float64Array(n).fill(0.001);
-  const M = new Float64Array(N);
-  const recomputeM = () => {
+  const sign = (s, i) => (s & (1 << i) ? b[i] : -1); // payoff multiple of f_i in outcome s
+  const multipliers = (f) => {
+    const M = new Float64Array(N);
     for (let s = 0; s < N; s++) {
       let m = 1;
-      for (let j = 0; j < n; j++) m += s & (1 << j) ? f[j] * items[j].b : -f[j];
+      for (let i = 0; i < n; i++) m += sign(s, i) * f[i];
       M[s] = m;
     }
+    return M;
   };
-  recomputeM();
-  for (let sweep = 0; sweep < 120; sweep++) {
-    recomputeM(); // reset float drift each sweep
-    let totChange = 0;
-    for (let i = 0; i < n; i++) {
-      const bi = items[i].b;
-      const mask = 1 << i;
-      for (let it = 0; it < 8; it++) {
-        let g1 = 0, g2 = 0, maxUp = Infinity;
-        for (let s = 0; s < N; s++) {
-          const a = s & mask ? bi : -1;
-          const m = M[s];
-          g1 += (prob[s] * a) / m;
-          g2 += (prob[s] * a * a) / (m * m);
-          if (a < 0 && m < maxUp) maxUp = m;
-        }
-        if (g2 < 1e-15) break;
-        let nf = f[i] + g1 / g2; // Newton ascent (g'' = −g2)
-        if (nf < 0) nf = 0;
-        const cap = f[i] + 0.95 * maxUp;
-        if (nf > cap) nf = cap;
-        const d = nf - f[i];
-        if (d !== 0) {
-          for (let s = 0; s < N; s++) M[s] += (s & mask ? bi : -1) * d;
-          f[i] = nf;
-        }
-        totChange += Math.abs(d);
-        if (Math.abs(d) < 1e-11) break;
+  const G = (f) => {
+    const M = multipliers(f);
+    let g = 0;
+    for (let s = 0; s < N; s++) {
+      if (M[s] <= 0) return -Infinity;
+      g += prob[s] * Math.log(M[s]);
+    }
+    return g;
+  };
+
+  // Full-vector Newton ascent. The optimum is interior w.r.t. f_i >= 0 for every
+  // positive-edge contract, so we only enforce the M(S) > 0 barrier via line search.
+  let f = new Array(n).fill(0.5 / n); // feasible, symmetric start (sum = 0.5)
+  for (let iter = 0; iter < 60; iter++) {
+    const M = multipliers(f);
+    const grad = new Float64Array(n);
+    const H = Array.from({ length: n }, () => new Float64Array(n));
+    for (let s = 0; s < N; s++) {
+      const invM = 1 / M[s];
+      const w = prob[s] * invM * invM;
+      const wg = prob[s] * invM;
+      for (let i = 0; i < n; i++) {
+        const ai = sign(s, i);
+        grad[i] += wg * ai;
+        for (let j = i; j < n; j++) H[i][j] -= w * ai * sign(s, j); // Hessian (neg. def.)
       }
     }
-    if (totChange < 1e-10) break;
+    for (let i = 0; i < n; i++) {
+      H[i][i] -= 1e-9; // tiny damping against ill-conditioning near the boundary
+      for (let j = 0; j < i; j++) H[i][j] = H[j][i];
+    }
+    // Newton step solves  H * delta = -grad  (ascent direction since H is neg. def.)
+    const delta = solveLinear(H, Array.from(grad, (x) => -x));
+    const gCur = G(f);
+    const dirDeriv = grad.reduce((s, gi, i) => s + gi * delta[i], 0);
+    let t = 1, fNew = f;
+    for (let ls = 0; ls < 50; ls++) {
+      const cand = f.map((x, i) => x + t * delta[i]);
+      if (cand.every((x) => x >= 0) && G(cand) >= gCur + 1e-4 * t * dirDeriv) { fNew = cand; break; }
+      t *= 0.5;
+      if (t < 1e-14) { fNew = f; break; }
+    }
+    const change = Math.max(...fNew.map((x, i) => Math.abs(x - f[i])));
+    f = fNew;
+    if (change < 1e-11) break;
   }
-  return Array.from(f);
+  return f;
+}
+
+// Gauss–Jordan solve of A x = rhs for small dense systems.
+function solveLinear(A, rhs) {
+  const n = rhs.length;
+  const M = A.map((row, i) => Array.from(row).concat(rhs[i]));
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    [M[col], M[piv]] = [M[piv], M[col]];
+    if (Math.abs(M[col][col]) < 1e-15) M[col][col] = M[col][col] < 0 ? -1e-15 : 1e-15;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const factor = M[r][col] / M[col][col];
+      for (let c = col; c <= n; c++) M[r][c] -= factor * M[col][c];
+    }
+  }
+  return M.map((row, i) => row[n] / row[i]);
 }
 
 // ---- joint per-round log-return moments at a given allocation ----
@@ -235,6 +269,7 @@ export default function KellyDesk() {
         const w = (s & (1 << i)) !== 0;
         pr *= w ? items[i].p : 1 - items[i].p;
         M += w ? alloc[i] * items[i].b : -alloc[i];
+
       }
       list[s] = { mask: s, prob: pr, mult: M };
       if (M < alpha) belowProb += pr;
