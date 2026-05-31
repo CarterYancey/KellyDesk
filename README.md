@@ -4,6 +4,38 @@ A bankroll management tool for investors who buy binary financial contracts — 
 
 ---
 
+### Install dependencies and start the dev server:
+ 
+```bash
+npm install
+npm run dev
+```
+ 
+Vite will print a local URL — typically `http://localhost:5173`. Open it in your browser. The dashboard hot-reloads on any file save.
+ 
+**Optional — production build:**
+ 
+```bash
+npm run build    # outputs to dist/
+npm run preview  # serves the production build locally
+```
+ 
+The `dist/` folder is a self-contained static site you can host anywhere (GitHub Pages, Netlify, S3, etc.).
+ 
+### Persistence Locally
+ 
+The `main.jsx` polyfill implementation backed by `localStorage`, giving the local build equivalent persistence — your state survives page refreshes and browser restarts, stored in the browser's local storage under the key `kelly-desk-state-v1`.
+ 
+If you want to reset all saved state, run this in the browser console:
+ 
+```js
+localStorage.removeItem('kelly-desk-state-v1')
+```
+ 
+then refresh the page.
+
+---
+
 ## Table of Contents
 
 1. [The Problem](#the-problem)
