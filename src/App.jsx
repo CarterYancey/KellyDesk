@@ -514,7 +514,7 @@ const CSS = `
 .kd-expbar-top b{font-family:'IBM Plex Mono',monospace;}
 .kd-expbar-track{height:7px;background:#0a0e14;border:1px solid #21262d;border-radius:4px;overflow:hidden;}
 .kd-expbar-fill{height:100%;transition:width .2s;}
-.kd-summary .kd-stat,.kd-sim .kd-stat{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #161b22;}
+.kd-summary .kd-stat{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #161b22;}
 .kd-stat-l{font-size:12px;color:#8b949e;}
 .kd-stat-v{font-family:'IBM Plex Mono',monospace;font-size:14px;color:#e6edf3;font-weight:500;}
 .kd-stat-v.pos{color:#3fb950;} .kd-stat-v.neg{color:#f85149;}
