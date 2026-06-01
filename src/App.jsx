@@ -111,33 +111,6 @@ function solveAtAversion(items, fKelly, a) {
   return warm;
 }
 
-// Smallest risk aversion a >= 1 whose joint ruin risk <= R. Sweeps a upward by
-// continuation, then refines on the bracketing interval with warm-started bisection.
-function aversionForRisk(items, fKelly, alpha, R) {
-  const riskOf = (f) => { const { m, v } = jointMoments(items, f); return ruinProb(alpha, m, v); };
-  if (items.length === 0 || riskOf(fKelly) <= R) return { a: 1, alloc: fKelly };
-  const grid = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 6, 7, 8, 10, 13, 16, 20, 26, 33, 40];
-  let warm = fKelly, prevA = 1;
-  for (let gi = 1; gi < grid.length; gi++) {
-    const a = grid[gi];
-    const steps = Math.max(1, Math.ceil((a - prevA) / 0.5));
-    let w = warm;
-    for (let k = 1; k <= steps; k++) w = solvePortfolio(items, prevA + ((a - prevA) * k) / steps, w);
-    if (riskOf(w) <= R) {
-      let lo = prevA, hi = a, hiF = w, bestF = w, bestA = a;
-      for (let it = 0; it < 14; it++) {
-        const mid = (lo + hi) / 2;
-        const mf = solvePortfolio(items, mid, hiF);
-        if (riskOf(mf) <= R) { hi = mid; hiF = mf; bestF = mf; bestA = mid; }
-        else lo = mid;
-      }
-      return { a: bestA, alloc: bestF };
-    }
-    warm = w; prevA = a;
-  }
-  return { a: 40, alloc: warm }; // even max aversion can't reach R (shouldn't happen)
-}
-
 // Gauss–Jordan solve of A x = rhs for small dense systems.
 function solveLinear(A, rhs) {
   const n = rhs.length;
@@ -181,35 +154,13 @@ function jointMoments(items, alloc) {
 
 const ruinProb = (alpha, m, v) => (m <= 0 ? 1 : Math.pow(alpha, (2 * m) / v));
 
-// ---- solve fraction-of-full-Kelly λ that hits a target ruin risk ----
-function lambdaForRisk(items, fStar, alpha, R) {
-  const risk = (lam) => {
-    const { m, v } = jointMoments(items, fStar.map((x) => x * lam));
-    return ruinProb(alpha, m, v);
-  };
-  if (risk(1) <= R) return 1;
-  let lo = 1e-4, hi = 1;
-  for (let it = 0; it < 50; it++) {
-    const mid = (lo + hi) / 2;
-    if (risk(mid) > R) hi = mid;
-    else lo = mid;
-  }
-  return (lo + hi) / 2;
-}
-
 const STORE_KEY = "kelly-desk-state-v1";
 const blank = (n) => ({ id: Math.random().toString(36).slice(2), name: n, cost: "", prob: "" });
 
 export default function KellyDesk() {
   const [bankroll, setBankroll] = useState(10000);
-  const [mode, setMode] = useState("risk");
-  const [method, setMethod] = useState("tilt"); // "scale" (cash) | "tilt" (re-weight to safety)
-  const [lambda, setLambda] = useState(0.5);
-  const [aversion, setAversion] = useState(2); // manual relative risk aversion for tilt mode
+  const [aversion, setAversion] = useState(2); // relative risk aversion (re-weights toward safety)
   const [alpha, setAlpha] = useState(0.5);
-  const [maxRisk, setMaxRisk] = useState(0.1);
-  const [maxExposure, setMaxExposure] = useState(1);
-  const [integer, setInteger] = useState(true);
   const [rows, setRows] = useState([
     { id: "a", name: "Contract A", cost: "0.25", prob: "0.50" },
     { id: "b", name: "Contract B", cost: "0.25", prob: "0.50" },
@@ -225,14 +176,8 @@ export default function KellyDesk() {
         if (r && r.value) {
           const s = JSON.parse(r.value);
           if (s.bankroll != null) setBankroll(s.bankroll);
-          if (s.mode) setMode(s.mode);
-          if (s.method) setMethod(s.method);
-          if (s.lambda != null) setLambda(s.lambda);
           if (s.aversion != null) setAversion(s.aversion);
           if (s.alpha != null) setAlpha(s.alpha);
-          if (s.maxRisk != null) setMaxRisk(s.maxRisk);
-          if (s.maxExposure != null) setMaxExposure(s.maxExposure);
-          if (s.integer != null) setInteger(s.integer);
           if (Array.isArray(s.rows)) setRows(s.rows);
         }
       } catch (e) {/* defaults */} finally { setLoaded(true); }
@@ -244,10 +189,10 @@ export default function KellyDesk() {
     (async () => {
       try {
         await window.storage.set(STORE_KEY, JSON.stringify(
-          { bankroll, mode, method, lambda, aversion, alpha, maxRisk, maxExposure, integer, rows }));
+          { bankroll, aversion, alpha, rows }));
       } catch (e) {/* in-memory only */}
     })();
-  }, [bankroll, mode, method, lambda, aversion, alpha, maxRisk, maxExposure, integer, rows, loaded]);
+  }, [bankroll, aversion, alpha, rows, loaded]);
 
   // valid positive-edge contracts feed the solver
   const items = useMemo(() => {
@@ -266,27 +211,12 @@ export default function KellyDesk() {
   const itemsKey = items.map((i) => i.rowId + ":" + i.p + ":" + i.c).join("|");
   const fStar = useMemo(() => solveJointKelly(items), [itemsKey]); // eslint-disable-line
 
-  // Resolve the applied allocation according to the selected method:
-  //   scale → uniform fractional Kelly (λ · f*, rest in cash)
-  //   tilt  → re-optimize at risk aversion a (CRRA), re-weighting toward safety
-  const { alloc, effLambda, effAversion } = useMemo(() => {
-    if (items.length === 0) return { alloc: [], effLambda: 1, effAversion: 1 };
-    let a, lam = 1, av = 1;
-    if (method === "scale") {
-      lam = mode === "risk" ? lambdaForRisk(items, fStar, alpha, maxRisk) : lambda;
-      a = fStar.map((x) => x * lam);
-    } else {
-      if (mode === "risk") {
-        const r = aversionForRisk(items, fStar, alpha, maxRisk);
-        av = r.a; a = r.alloc;
-      } else {
-        av = aversion; a = solveAtAversion(items, fStar, av);
-      }
-    }
-    const tot = a.reduce((s, x) => s + x, 0);
-    if (tot > maxExposure && tot > 0) a = a.map((x) => (x * maxExposure) / tot);
-    return { alloc: a, effLambda: lam, effAversion: av };
-  }, [items, itemsKey, fStar, method, mode, lambda, aversion, alpha, maxRisk, maxExposure]); // eslint-disable-line
+  // Resolve the applied allocation: re-optimize at relative risk aversion a (CRRA),
+  // re-weighting toward safer contracts.
+  const alloc = useMemo(() => {
+    if (items.length === 0) return [];
+    return solveAtAversion(items, fStar, aversion);
+  }, [items, itemsKey, fStar, aversion]); // eslint-disable-line
 
   const mom = useMemo(() => jointMoments(items, alloc), [items, alloc]);
   const kEff = mom.v > 0 ? (2 * mom.m) / mom.v : 0;
@@ -302,11 +232,11 @@ export default function KellyDesk() {
       const e = byId[r.id];
       const fk = e ? e.fk : 0, ap = e ? e.ap : 0;
       const dollars = ap * bankroll;
-      const n = e && c > 0 ? (integer ? Math.floor(dollars / c) : dollars / c) : 0;
+      const n = e && c > 0 ? Math.floor(dollars / c) : 0;
       const stake = n * c;
       return { ...r, c, p, valid, edge: valid ? p - c : 0, posEdge: !!e, fk, ap, n, stake };
     });
-  }, [rows, items, fStar, alloc, bankroll, integer]);
+  }, [rows, items, fStar, alloc, bankroll]);
 
   const totals = useMemo(() => {
     const staked = calc.reduce((s, x) => s + (x.stake > 0 ? x.stake : 0), 0);
@@ -400,45 +330,13 @@ export default function KellyDesk() {
       <div className="kd-grid">
         <section className="kd-card kd-policy">
           <div className="kd-card-h">SIZING POLICY</div>
-          <div className="kd-toggle">
-            <button className={mode === "risk" ? "on" : ""} onClick={() => setMode("risk")}>Target risk of ruin</button>
-            <button className={mode === "manual" ? "on" : ""} onClick={() => setMode("manual")}>Manual</button>
+          <div className="kd-controls">
+            <Slider label="Ruin = drawdown to" value={alpha} min={0.05} max={0.95} step={0.05}
+              onChange={setAlpha} fmt={(v) => fmtPct(v, 0) + " of bankroll"} />
+            <Slider label="Relative risk aversion (a)" value={aversion} min={1} max={10} step={0.25}
+              onChange={setAversion} fmt={(v) => (v <= 1 ? "1.00 (full Kelly)" : v.toFixed(2))} />
+            <div className="kd-derived">→ {fmtPct(risk, 1)} chance of ever reaching {fmtPct(alpha, 0)} of bankroll</div>
           </div>
-          <div className="kd-methodlabel">Reduce risk by</div>
-          <div className="kd-toggle">
-            <button className={method === "tilt" ? "on" : ""} onClick={() => setMethod("tilt")}>Tilt to safety</button>
-            <button className={method === "scale" ? "on" : ""} onClick={() => setMethod("scale")}>Scale to cash</button>
-          </div>
-          {mode === "risk" ? (
-            <div className="kd-controls">
-              <Slider label="Ruin = drawdown to" value={alpha} min={0.05} max={0.95} step={0.05}
-                onChange={setAlpha} fmt={(v) => fmtPct(v, 0) + " of bankroll"} />
-              <Slider label="Max acceptable risk" value={maxRisk} min={0.01} max={0.5} step={0.01}
-                onChange={setMaxRisk} fmt={(v) => fmtPct(v, 0) + " chance"} />
-              <div className="kd-derived">
-                {method === "tilt"
-                  ? <>→ risk aversion <b>a = {effAversion.toFixed(2)}</b>, re-weighting toward safer contracts</>
-                  : <>→ <b>{(effLambda * 100).toFixed(0)}%</b> of full Kelly, rest held in cash</>}
-              </div>
-            </div>
-          ) : (
-            <div className="kd-controls">
-              {method === "tilt" ? (
-                <Slider label="Relative risk aversion (a)" value={aversion} min={1} max={10} step={0.25}
-                  onChange={setAversion} fmt={(v) => (v <= 1 ? "1.00 (full Kelly)" : v.toFixed(2))} />
-              ) : (
-                <Slider label="Fraction of full joint Kelly (λ)" value={lambda} min={0.05} max={1} step={0.05}
-                  onChange={setLambda} fmt={(v) => v.toFixed(2) + "×"} />
-              )}
-              <div className="kd-derived">→ {fmtPct(risk, 1)} chance of ever reaching {fmtPct(alpha, 0)} of bankroll</div>
-            </div>
-          )}
-          <Slider label="Hard exposure cap" value={maxExposure} min={0.25} max={1} step={0.05}
-            onChange={setMaxExposure} fmt={(v) => (v >= 1 ? "off (100%)" : fmtPct(v, 0))} />
-          <label className="kd-check">
-            <input type="checkbox" checked={integer} onChange={(e) => setInteger(e.target.checked)} />
-            Whole contracts only
-          </label>
         </section>
 
         <section className="kd-card kd-risk">
@@ -565,7 +463,7 @@ export default function KellyDesk() {
           <p><b>Joint objective:</b> <code>G(f) = Σ_S P(S)·ln(1 + Σ_{"{i∈S}"} fᵢbᵢ − Σ_{"{i∉S}"} fᵢ)</code>, maximized over fᵢ ≥ 0, where S = each win/lose combo, bᵢ = (1−cᵢ)/cᵢ.</p>
           <p><b>No over-leverage:</b> the all-lose term <code>ln(1 − Σfᵢ)</code> → −∞ as Σfᵢ → 1, so the optimum keeps total exposure strictly below 100% on its own.</p>
           <p><b>Risk of ruin:</b> from the joint per-round log-return moments m (mean) and v (variance), <code>P(ever reach α) ≈ α^(2m/v)</code>. Simultaneous bets raise v, which raises ruin risk versus betting them one at a time.</p>
-          <p><b>Fractional Kelly:</b> the whole optimal vector is scaled by λ ∈ (0,1]; the risk-target mode binary-searches λ to hit your tolerance.</p>
+          <p><b>Risk aversion:</b> raising a re-solves the portfolio under CRRA utility <code>U(M) = M^(1−a)/(1−a)</code> (log utility at a = 1, full Kelly), tilting weight toward safer contracts.</p>
           <p className="kd-caveat">Assumes contracts are <i>independent</i>. Correlated outcomes (e.g. two contracts on related events) need a joint distribution, not the product of marginals — coming next if useful. And Kelly is savagely sensitive to your P(win) estimates, which is the real reason to bet a fraction of it.</p>
         </div>
       </details>
@@ -603,17 +501,12 @@ const CSS = `
 .kd-card{background:#0d1117;border:1px solid #1f2730;border-radius:8px;padding:14px;}
 .kd-card-h{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:2px;color:#6b7785;margin-bottom:12px;}
 .kd-th-row{display:flex;justify-content:space-between;align-items:center;}
-.kd-toggle{display:flex;gap:6px;margin-bottom:14px;}
-.kd-methodlabel{font-size:10px;letter-spacing:1px;color:#4a5568;margin:-4px 0 6px;text-transform:uppercase;}
-.kd-toggle button{flex:1;background:#0a0e14;border:1px solid #2a3441;color:#8b949e;border-radius:6px;padding:7px 4px;font-size:11px;cursor:pointer;font-family:inherit;transition:.15s;}
-.kd-toggle button.on{background:#1f6feb22;border-color:#1f6feb;color:#58a6ff;}
 .kd-controls{display:flex;flex-direction:column;gap:14px;margin-bottom:14px;}
 .kd-slider-top{display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px;}
 .kd-slider-top b{font-family:'IBM Plex Mono',monospace;color:#e6edf3;}
 .kd-slider input[type=range]{width:100%;accent-color:#58a6ff;}
 .kd-derived{font-size:12px;color:#8b949e;background:#0a0e14;border:1px solid #1f2730;border-radius:6px;padding:8px 10px;font-family:'IBM Plex Mono',monospace;}
 .kd-derived b{color:#58a6ff;}
-.kd-check{display:flex;align-items:center;gap:8px;font-size:12px;color:#8b949e;margin-top:4px;cursor:pointer;}
 .kd-bignum{font-family:'IBM Plex Mono',monospace;font-size:40px;font-weight:600;line-height:1;}
 .kd-bignum-cap{font-size:11px;color:#6b7785;margin:6px 0 10px;}
 .kd-curve{width:100%;height:70px;}
