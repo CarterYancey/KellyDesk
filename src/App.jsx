@@ -19,6 +19,23 @@ const fmtMoney = (x) =>
   (x < 0 ? "-$" : "$") +
   Math.abs(x).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtPct = (x, d = 1) => (x * 100).toFixed(d) + "%";
+// compact money for axis ticks: $1.2k, $3.4M, $850
+const fmtMoneyShort = (x) => {
+  const a = Math.abs(x), s = x < 0 ? "-$" : "$";
+  if (a >= 1e6) return s + (a / 1e6).toFixed(a >= 1e7 ? 0 : 1) + "M";
+  if (a >= 1e3) return s + (a / 1e3).toFixed(a >= 1e4 ? 0 : 1) + "k";
+  return s + a.toFixed(a >= 100 ? 0 : a >= 10 ? 1 : 2);
+};
+// "nice" round tick values spanning [min,max]
+const niceTicks = (min, max, count = 5) => {
+  const range = (max - min) || 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(range / count)));
+  const norm = range / count / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+  const out = [];
+  for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-6; v += step) out.push(v);
+  return out;
+};
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 const MAX_N = 16; // exact 2ⁿ enumeration cap
 
@@ -277,20 +294,22 @@ export default function KellyDesk() {
 
   // probability-weighted end-value distribution, binned by multiplier
   const histo = useMemo(() => {
-    const BINS = 28;
-    if (outcomes.n === 0) return { bins: [], maxP: 0, lo: 0, hi: 1, alphaPos: 0 };
+    const BINS = 40;
+    if (outcomes.n === 0) return { bins: [], maxP: 0, lo: 0, hi: 1, mean: 1 };
     let lo = outcomes.minMult, hi = outcomes.maxMult;
     if (hi - lo < 1e-9) { lo -= 0.01; hi += 0.01; }
     const width = (hi - lo) / BINS;
     const bins = Array.from({ length: BINS }, (_, k) => ({ x0: lo + k * width, x1: lo + (k + 1) * width, p: 0 }));
+    let mean = 0;
     for (const o of outcomes.list) {
+      mean += o.prob * o.mult;
       let k = Math.floor((o.mult - lo) / width);
       if (k < 0) k = 0; else if (k >= BINS) k = BINS - 1;
       bins[k].p += o.prob;
     }
     const maxP = bins.reduce((m, b) => Math.max(m, b.p), 0);
-    return { bins, maxP, lo, hi, alphaPos: clamp((alpha - lo) / (hi - lo), 0, 1) };
-  }, [outcomes, alpha]);
+    return { bins, maxP, lo, hi, mean };
+  }, [outcomes]);
 
   const updateRow = (id, field, val) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, [field]: val } : r)));
   const addRow = () => setRows((rs) => [...rs, blank("Contract " + String.fromCharCode(65 + rs.length))]);
@@ -413,16 +432,7 @@ export default function KellyDesk() {
             <div className="kd-bignum-cap">
               chance this single round ends below {fmtPct(alpha, 0)} of bankroll ({fmtMoney(alpha * bankroll)})
             </div>
-            <svg viewBox="0 0 280 90" className="kd-histo" preserveAspectRatio="none">
-              {histo.bins.map((b, k) => {
-                const bw = 280 / histo.bins.length;
-                const h = histo.maxP > 0 ? (b.p / histo.maxP) * 88 : 0;
-                return <rect key={k} x={k * bw + 0.5} y={90 - h} width={Math.max(bw - 1, 0.5)} height={h}
-                  fill={b.x1 <= alpha ? "#f85149" : "#58a6ff"} opacity="0.85" />;
-              })}
-              <line x1={histo.alphaPos * 280} y1="0" x2={histo.alphaPos * 280} y2="90" stroke="#d29922" strokeWidth="1" strokeDasharray="3 2" />
-            </svg>
-            <div className="kd-curve-cap"><span>← lower end value</span><span>P-weighted end value · ↑ drawdown α</span></div>
+            <EndValuePdf histo={histo} bankroll={bankroll} alpha={alpha} />
 
             <div className="kd-otable">
               <div className="kd-otr kd-othead">
@@ -485,6 +495,87 @@ function Stat({ label, value, accent }) {
   );
 }
 
+// Probability density of end-of-round portfolio size, from the exact 2ⁿ
+// outcome distribution. X-axis = dollar value of the bankroll after one
+// round; Y-axis = probability mass in each bin. The ruin threshold α,
+// the starting bankroll and the expected end value are marked.
+function EndValuePdf({ histo, bankroll, alpha }) {
+  if (!histo.bins.length || histo.maxP <= 0) return null;
+  const W = 720, H = 260, m = { l: 60, r: 18, t: 20, b: 46 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const { lo, hi, maxP, mean } = histo;
+  const x$ = (mult) => m.l + ((mult - lo) / (hi - lo)) * iw;   // multiplier → px
+  const yP = (p) => m.t + (1 - p / maxP) * ih;                 // probability → px
+  const base = m.t + ih;
+
+  const xticks = niceTicks(lo * bankroll, hi * bankroll, 6)
+    .filter((d) => d >= lo * bankroll - 1e-9 && d <= hi * bankroll + 1e-9);
+  const yticks = niceTicks(0, maxP, 4);
+
+  const ruinX = x$(alpha), startX = x$(1), meanX = x$(mean);
+  const inRange = (mult) => mult >= lo - 1e-9 && mult <= hi + 1e-9;
+
+  return (
+    <div className="kd-pdf-wrap">
+      <svg viewBox={`0 0 ${W} ${H}`} className="kd-pdf" preserveAspectRatio="xMidYMid meet">
+        {/* y gridlines + probability labels */}
+        {yticks.map((p, i) => (
+          <g key={"y" + i}>
+            <line x1={m.l} y1={yP(p)} x2={m.l + iw} y2={yP(p)} stroke="#1b2230" strokeWidth="1" />
+            <text x={m.l - 8} y={yP(p) + 3} textAnchor="end" className="kd-pdf-tick">{fmtPct(p, p < 0.1 ? 1 : 0)}</text>
+          </g>
+        ))}
+        {/* shaded ruin region (below α) */}
+        {ruinX > m.l && (
+          <rect x={m.l} y={m.t} width={Math.min(ruinX, m.l + iw) - m.l} height={ih} fill="#f8514910" />
+        )}
+        {/* density bars */}
+        {histo.bins.map((b, k) => {
+          const xa = x$(b.x0), xb = x$(b.x1);
+          const h = (b.p / maxP) * ih;
+          if (h <= 0) return null;
+          return <rect key={k} x={xa} y={base - h} width={Math.max(xb - xa - 0.6, 0.4)} height={h}
+            fill={b.x1 <= alpha ? "#f85149" : "#58a6ff"} opacity="0.9" />;
+        })}
+        {/* axes */}
+        <line x1={m.l} y1={base} x2={m.l + iw} y2={base} stroke="#30363d" strokeWidth="1" />
+        <line x1={m.l} y1={m.t} x2={m.l} y2={base} stroke="#30363d" strokeWidth="1" />
+        {/* x ticks: portfolio size in $ */}
+        {xticks.map((d, i) => (
+          <g key={"x" + i}>
+            <line x1={x$(d / bankroll)} y1={base} x2={x$(d / bankroll)} y2={base + 4} stroke="#30363d" strokeWidth="1" />
+            <text x={x$(d / bankroll)} y={base + 16} textAnchor="middle" className="kd-pdf-tick">{fmtMoneyShort(d)}</text>
+          </g>
+        ))}
+        {/* markers: ruin α, starting bankroll, expected end value */}
+        {inRange(alpha) && (
+          <g>
+            <line x1={ruinX} y1={m.t - 4} x2={ruinX} y2={base} stroke="#d29922" strokeWidth="1.3" strokeDasharray="4 3" />
+            <text x={ruinX} y={m.t - 8} textAnchor="middle" className="kd-pdf-mark" fill="#d29922">ruin α · {fmtMoneyShort(alpha * bankroll)}</text>
+          </g>
+        )}
+        {inRange(1) && (
+          <line x1={startX} y1={m.t} x2={startX} y2={base} stroke="#6b7785" strokeWidth="1" strokeDasharray="2 3" />
+        )}
+        {inRange(mean) && (
+          <g>
+            <line x1={meanX} y1={m.t - 4} x2={meanX} y2={base} stroke="#3fb950" strokeWidth="1.3" strokeDasharray="4 3" />
+            <text x={meanX} y={m.t - 8} textAnchor="middle" className="kd-pdf-mark" fill="#3fb950">E[end] · {fmtMoneyShort(mean * bankroll)}</text>
+          </g>
+        )}
+        {/* axis titles */}
+        <text x={m.l + iw / 2} y={H - 6} textAnchor="middle" className="kd-pdf-axis">portfolio size after one round ($)</text>
+        <text x={14} y={m.t + ih / 2} textAnchor="middle" className="kd-pdf-axis" transform={`rotate(-90 14 ${m.t + ih / 2})`}>probability</text>
+      </svg>
+      <div className="kd-pdf-legend">
+        <span><i style={{ background: "#f85149" }} />below α (ruin)</span>
+        <span><i style={{ background: "#58a6ff" }} />above α</span>
+        <span><i className="dash" style={{ background: "#6b7785" }} />start ({fmtMoneyShort(bankroll)})</span>
+      </div>
+    </div>
+  );
+}
+
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 .kd-root{font-family:'IBM Plex Sans',system-ui,sans-serif;background:#0a0e14;color:#c9d1d9;padding:22px;border-radius:10px;max-width:1000px;margin:0 auto;}
@@ -535,7 +626,15 @@ const CSS = `
 .kd-del{background:none;border:none;color:#4a5568;font-size:16px;cursor:pointer;line-height:1;}
 .kd-del:hover{color:#f85149;}
 .kd-note{font-size:11px;color:#6b7785;line-height:1.5;margin-top:12px;}
-.kd-histo{width:100%;height:80px;margin:10px 0 0;}
+.kd-pdf-wrap{margin:14px 0 4px;}
+.kd-pdf{width:100%;height:auto;display:block;}
+.kd-pdf-tick{font-family:'IBM Plex Mono',monospace;font-size:10px;fill:#6b7785;}
+.kd-pdf-mark{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;}
+.kd-pdf-axis{font-size:10px;letter-spacing:.5px;fill:#8b949e;}
+.kd-pdf-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:#8b949e;margin-top:6px;padding-left:6px;}
+.kd-pdf-legend span{display:inline-flex;align-items:center;gap:5px;}
+.kd-pdf-legend i{width:11px;height:11px;border-radius:2px;display:inline-block;}
+.kd-pdf-legend i.dash{width:14px;height:0;border-top:2px dashed #6b7785;background:none!important;}
 .kd-otable{font-family:'IBM Plex Mono',monospace;margin-top:14px;max-height:420px;overflow-y:auto;}
 .kd-otr{display:grid;grid-template-columns:2fr 1fr 1fr 1.1fr;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid #161b22;}
 .kd-othead{font-size:9.5px;color:#6b7785;letter-spacing:.5px;border-bottom:1px solid #2a3441;padding-bottom:8px;position:sticky;top:0;background:#0d1117;z-index:1;}
