@@ -15,3 +15,9 @@ Contracts B and C have the same P(win), but C is much cheaper. It makes sense to
 3. The graph under the 2^n enumeration Risk of Ruin percentage is uninterpretable. I want to see an actual probability density function graph with portfolio size on the X-axis.
 
 4. Come up with some way to link correlated contracts. In the above example, ContractA cannot be True and ContractD false (although ContractD can be True and ContractA false). 
+
+5. `Edge` should not be in raw cents
+
+6. Risk of Ruin calculator should be better explained and have a time-limit or expected rounds until ruin or something of the sort.
+
+7. Cost and P(win) entry is annyoing because I have to do the decimal manually. The decimal should be always implied (or the values in cents/percents by default; so I can just enter 25 and 50 instead of .25 and .50).
