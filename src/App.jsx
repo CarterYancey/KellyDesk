@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { buildClusters, jointProbArray, derivePairwise, pairwiseQuantities, nestedTable, PW_LABEL } from "./joint.js";
 
 /* ============================================================
    KELLY DESK — simultaneous binary-contract bankroll manager
@@ -36,24 +37,18 @@ const niceTicks = (min, max, count = 5) => {
   for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-6; v += step) out.push(v);
   return out;
 };
-const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 const MAX_N = 16; // exact 2ⁿ enumeration cap
+const LINK_COLORS = ["#58a6ff", "#3fb950", "#d29922", "#bc8cff", "#39c5cf", "#f778ba", "#db6d28", "#a5d6ff"];
 
 // ---- portfolio solver: maximizes expected CRRA power utility ----
 // a = relative risk aversion. a = 1 is log utility = full Kelly.
 // a > 1 tilts toward safer (higher-p) contracts and punishes ruin tails harder.
 // The objective is globally concave in f for every a > 0, so Newton converges.
-function solvePortfolio(items, a = 1, init = null) {
+function solvePortfolio(items, prob, a = 1, init = null) {
   const n = items.length;
   if (n === 0) return [];
   const N = 1 << n;
   const b = items.map((it) => it.b);
-  const prob = new Float64Array(N);
-  for (let s = 0; s < N; s++) {
-    let pr = 1;
-    for (let i = 0; i < n; i++) pr *= s & (1 << i) ? items[i].p : 1 - items[i].p;
-    prob[s] = pr;
-  }
   const sign = (s, i) => (s & (1 << i) ? b[i] : -1);
   const multipliers = (f) => {
     const M = new Float64Array(N);
@@ -113,18 +108,18 @@ function solvePortfolio(items, a = 1, init = null) {
   return f;
 }
 
-const solveJointKelly = (items) => solvePortfolio(items, 1); // full Kelly = log utility
+const solveJointKelly = (items, prob) => solvePortfolio(items, prob, 1); // full Kelly = log utility
 
 // Continuation (homotopy) solve: walk risk aversion up from 1 (full Kelly) in small
 // steps, warm-starting each step from the previous solution. This keeps every Newton
 // solve interior and well-conditioned, avoiding the boundary stiffness that makes a
 // single high-a solve started from the full-Kelly point fail to converge.
-function solveAtAversion(items, fKelly, a) {
+function solveAtAversion(items, prob, fKelly, a) {
   if (items.length === 0) return [];
   if (a <= 1.0001) return fKelly;
   const steps = Math.max(2, Math.ceil((a - 1) / 0.5));
   let warm = fKelly;
-  for (let k = 1; k <= steps; k++) warm = solvePortfolio(items, 1 + ((a - 1) * k) / steps, warm);
+  for (let k = 1; k <= steps; k++) warm = solvePortfolio(items, prob, 1 + ((a - 1) * k) / steps, warm);
   return warm;
 }
 
@@ -147,24 +142,24 @@ function solveLinear(A, rhs) {
 }
 
 // ---- joint per-round log-return moments at a given allocation ----
-function jointMoments(items, alloc) {
+function jointMoments(items, prob, alloc) {
   const n = items.length;
   if (n === 0) return { m: 0, v: 0, allLoseP: 0, exposure: 0 };
   const N = 1 << n;
   let m = 0, m2 = 0;
   for (let s = 0; s < N; s++) {
-    let pr = 1, M = 1;
+    let M = 1;
     for (let i = 0; i < n; i++) {
       const w = (s & (1 << i)) !== 0;
-      pr *= w ? items[i].p : 1 - items[i].p;
       M += w ? alloc[i] * items[i].b : -alloc[i];
     }
+    const pr = prob[s];
     const l = Math.log(Math.max(M, 1e-12));
     m += pr * l;
     m2 += pr * l * l;
   }
   const v = Math.max(m2 - m * m, 1e-12);
-  const allLoseP = items.reduce((a, it) => a * (1 - it.p), 1);
+  const allLoseP = prob[0]; // joint P(all contracts lose)
   const exposure = alloc.reduce((a, x) => a + x, 0);
   return { m, v, allLoseP, exposure };
 }
@@ -183,6 +178,7 @@ export default function KellyDesk() {
     { id: "b", name: "Contract B", cost: "0.25", prob: "0.50" },
     { id: "c", name: "Contract C", cost: "0.25", prob: "0.50" },
   ]);
+  const [links, setLinks] = useState([]); // declared correlations between contracts
   const [loaded, setLoaded] = useState(false);
   const [sim, setSim] = useState(null);
 
@@ -196,6 +192,7 @@ export default function KellyDesk() {
           if (s.aversion != null) setAversion(s.aversion);
           if (s.alpha != null) setAlpha(s.alpha);
           if (Array.isArray(s.rows)) setRows(s.rows);
+          if (Array.isArray(s.links)) setLinks(s.links);
         }
       } catch (e) {/* defaults */} finally { setLoaded(true); }
     })();
@@ -206,17 +203,17 @@ export default function KellyDesk() {
     (async () => {
       try {
         await window.storage.set(STORE_KEY, JSON.stringify(
-          { bankroll, aversion, alpha, rows }));
+          { bankroll, aversion, alpha, rows, links }));
       } catch (e) {/* in-memory only */}
     })();
-  }, [bankroll, aversion, alpha, rows, loaded]);
+  }, [bankroll, aversion, alpha, rows, links, loaded]);
 
   // valid positive-edge contracts feed the solver
   const items = useMemo(() => {
     const list = rows.map((r) => {
       const c = parseFloat(r.cost), p = parseFloat(r.prob);
       const valid = c > 0 && c < 1 && p >= 0 && p <= 1;
-      return { rowId: r.id, p, c, b: (1 - c) / c, valid, edge: valid ? p - c : -1 };
+      return { rowId: r.id, name: r.name, p, c, b: (1 - c) / c, valid, edge: valid ? p - c : -1 };
     }).filter((x) => x.valid && x.edge > 0);
     return list.slice(0, MAX_N);
   }, [rows]);
@@ -226,16 +223,29 @@ export default function KellyDesk() {
   }).length > MAX_N;
 
   const itemsKey = items.map((i) => i.rowId + ":" + i.p + ":" + i.c).join("|");
-  const fStar = useMemo(() => solveJointKelly(items), [itemsKey]); // eslint-disable-line
+  const linksKey = links.map((l) => `${l.id}:${l.type}:${l.members.join(",")}:${JSON.stringify(l.assoc || null)}`).join("|");
+
+  // Build correlated clusters and compose the true joint prob[s]. Both recompute
+  // together on the same deps; the optimizer math downstream is unchanged.
+  const { clusters, linkErrors } = useMemo(
+    () => buildClusters(items, links),
+    [itemsKey, linksKey] // eslint-disable-line
+  );
+  const prob = useMemo(
+    () => jointProbArray(items, clusters),
+    [itemsKey, linksKey] // eslint-disable-line
+  );
+
+  const fStar = useMemo(() => solveJointKelly(items, prob), [itemsKey, linksKey]); // eslint-disable-line
 
   // Resolve the applied allocation: re-optimize at relative risk aversion a (CRRA),
   // re-weighting toward safer contracts.
   const alloc = useMemo(() => {
     if (items.length === 0) return [];
-    return solveAtAversion(items, fStar, aversion);
-  }, [items, itemsKey, fStar, aversion]); // eslint-disable-line
+    return solveAtAversion(items, prob, fStar, aversion);
+  }, [itemsKey, linksKey, fStar, aversion]); // eslint-disable-line
 
-  const mom = useMemo(() => jointMoments(items, alloc), [items, alloc]);
+  const mom = useMemo(() => jointMoments(items, prob, alloc), [items, prob, alloc]);
   const kEff = mom.v > 0 ? (2 * mom.m) / mom.v : 0;
   const risk = ruinProb(alpha, mom.m, mom.v);
 
@@ -270,20 +280,19 @@ export default function KellyDesk() {
     const list = new Array(N);
     let belowProb = 0, minMult = Infinity, maxMult = -Infinity;
     for (let s = 0; s < N; s++) {
-      let pr = 1, M = 1;
+      let M = 1;
       for (let i = 0; i < n; i++) {
         const w = (s & (1 << i)) !== 0;
-        pr *= w ? items[i].p : 1 - items[i].p;
         M += w ? alloc[i] * items[i].b : -alloc[i];
-
       }
+      const pr = prob[s];
       list[s] = { mask: s, prob: pr, mult: M };
       if (M < alpha) belowProb += pr;
       if (M < minMult) minMult = M;
       if (M > maxMult) maxMult = M;
     }
     return { list, belowProb, n, minMult, maxMult };
-  }, [items, alloc, alpha]);
+  }, [items, prob, alloc, alpha]);
 
   // top outcomes by probability for the table (full 2ⁿ list is too large to render)
   const topOutcomes = useMemo(
@@ -313,7 +322,30 @@ export default function KellyDesk() {
 
   const updateRow = (id, field, val) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, [field]: val } : r)));
   const addRow = () => setRows((rs) => [...rs, blank("Contract " + String.fromCharCode(65 + rs.length))]);
-  const delRow = (id) => setRows((rs) => rs.filter((r) => r.id !== id));
+  const delRow = (id) => {
+    setRows((rs) => rs.filter((r) => r.id !== id));
+    // drop the deleted contract from any link; remove links that fall below 2 members
+    setLinks((ls) => ls
+      .map((l) => ({ ...l, members: l.members.filter((m) => m !== id) }))
+      .filter((l) => l.members.length >= 2));
+  };
+
+  // link CRUD + per-link color for the membership dots
+  const addLink = useCallback((link) => setLinks((ls) => [...ls, link]), []);
+  const removeLink = useCallback((id) => setLinks((ls) => ls.filter((l) => l.id !== id)), []);
+  const linkErrorMap = useMemo(() => {
+    const m = {};
+    for (const e of linkErrors) m[e.id] = e.msg;
+    return m;
+  }, [linkErrors]);
+  const colorByRow = useMemo(() => {
+    const map = {};
+    links.forEach((l, idx) => {
+      const c = LINK_COLORS[idx % LINK_COLORS.length];
+      l.members.forEach((m) => (map[m] = c));
+    });
+    return map;
+  }, [links]);
 
   const curve = useMemo(() => {
     const W = 280, H = 90, pts = [];
@@ -384,7 +416,9 @@ export default function KellyDesk() {
           <Stat label="Log-growth / round" value={(mom.m >= 0 ? "+" : "") + (mom.m * 100).toFixed(2) + "%"} accent={mom.m >= 0 ? "pos" : "neg"} />
           <div className="kd-cat">
             ☠ All-lose round: <b>{fmtPct(mom.allLoseP, 1)}</b> chance, costs <b>{fmtPct(mom.exposure, 0)}</b> of bankroll.
-            Exposure is solver-capped below 100%, so a single round can never fully wipe you out.
+            {links.length > 0
+              ? " This probability reflects the correlations you've declared between contracts (not an independence assumption)."
+              : " Exposure is solver-capped below 100%, so a single round can never fully wipe you out."}
           </div>
         </section>
       </div>
@@ -398,7 +432,10 @@ export default function KellyDesk() {
           </div>
           {calc.map((r) => (
             <div className="kd-tr" key={r.id}>
-              <input className="kd-name" value={r.name} onChange={(e) => updateRow(r.id, "name", e.target.value)} />
+              <div className="kd-namewrap">
+                {colorByRow[r.id] && <span className="kd-link-dot" style={{ background: colorByRow[r.id] }} title="linked contract" />}
+                <input className="kd-name" value={r.name} onChange={(e) => updateRow(r.id, "name", e.target.value)} />
+              </div>
               <input className="kd-num" type="number" step="0.01" value={r.cost} placeholder="0.00"
                 onChange={(e) => updateRow(r.id, "cost", e.target.value)} />
               <input className="kd-num" type="number" step="0.01" value={r.prob} placeholder="0.00"
@@ -419,6 +456,8 @@ export default function KellyDesk() {
           “Sized” applies your risk policy and exposure cap. {overCap && <b style={{ color: "#d29922" }}>Only the first {MAX_N} positive-edge contracts are solved exactly.</b>}
         </div>
       </section>
+
+      <LinkPanel rows={rows} links={links} linkErrorMap={linkErrorMap} colorByRow={colorByRow} onAdd={addLink} onRemove={removeLink} />
 
       <section className="kd-card">
         <div className="kd-card-h">EXACT SINGLE-ROUND OUTCOMES (2ⁿ ENUMERATION)</div>
@@ -474,7 +513,8 @@ export default function KellyDesk() {
           <p><b>No over-leverage:</b> the all-lose term <code>ln(1 − Σfᵢ)</code> → −∞ as Σfᵢ → 1, so the optimum keeps total exposure strictly below 100% on its own.</p>
           <p><b>Risk of ruin:</b> from the joint per-round log-return moments m (mean) and v (variance), <code>P(ever reach α) ≈ α^(2m/v)</code>. Simultaneous bets raise v, which raises ruin risk versus betting them one at a time.</p>
           <p><b>Risk aversion:</b> raising a re-solves the portfolio under CRRA utility <code>U(M) = M^(1−a)/(1−a)</code> (log utility at a = 1, full Kelly), tilting weight toward safer contracts.</p>
-          <p className="kd-caveat">Assumes contracts are <i>independent</i>. Correlated outcomes (e.g. two contracts on related events) need a joint distribution, not the product of marginals — coming next if useful. And Kelly is savagely sensitive to your P(win) estimates, which is the real reason to bet a fraction of it.</p>
+          <p><b>Correlated contracts:</b> by default outcomes are independent (<code>prob[s] = ∏ᵢ pᵢ</code>). Declaring a <i>link</i> (nested implication, mutually exclusive, or a pairwise association) replaces the independent product over those contracts with the correct joint — staircase for nesting, single-winner for exclusivity, or the Fréchet-feasible two-cell solve for a pairwise input — and the solver, risk, and outcome enumeration all consume that joint unchanged.</p>
+          <p className="kd-caveat">Kelly is savagely sensitive to your P(win) estimates, which is the real reason to bet a fraction of it. Linked correlations are equally sensitive to the association value you enter — an infeasible value is rejected against the Fréchet–Hoeffding bounds.</p>
         </div>
       </details>
     </div>
@@ -492,6 +532,225 @@ function Slider({ label, value, min, max, step, onChange, fmt }) {
 function Stat({ label, value, accent }) {
   return (
     <div className="kd-stat"><span className="kd-stat-l">{label}</span><span className={"kd-stat-v " + (accent || "")}>{value}</span></div>
+  );
+}
+
+// ---------- Linked Contracts panel (declare correlations) ----------
+const QUANT_ORDER = ["P(A)", "P(B)", "P(A∧B)", "P(A|B)", "P(A|~B)", "P(B|A)", "P(B|~A)", "corr", "odds"];
+const fmtQ = (k, x) => {
+  if (!isFinite(x)) return k === "odds" ? "∞" : "—";
+  if (k === "odds") return x.toFixed(2);
+  if (k === "corr") return (x >= 0 ? "+" : "") + x.toFixed(2);
+  return x.toFixed(3);
+};
+const fmtRange = (v) => (isFinite(v) ? v.toFixed(3) : v > 0 ? "∞" : "−∞");
+
+function LinkPanel({ rows, links, linkErrorMap, colorByRow, onAdd, onRemove }) {
+  const [draft, setDraft] = useState(null);
+
+  const isValidContract = (r) => {
+    const c = parseFloat(r.cost), p = parseFloat(r.prob);
+    return c > 0 && c < 1 && p >= 0 && p <= 1;
+  };
+  const linkedSet = new Set(links.flatMap((l) => l.members));
+  const rowById = (id) => rows.find((r) => r.id === id);
+  const nameOf = (id) => rowById(id)?.name || id;
+  const pOf = (id) => parseFloat(rowById(id)?.prob);
+  const linkable = rows.filter((r) => isValidContract(r) && !linkedSet.has(r.id));
+
+  const startDraft = () => setDraft({ members: [], type: "pairwise", assoc: { input: "P(A|B)", value: "" } });
+
+  const toggleMember = (id) =>
+    setDraft((d) => {
+      const has = d.members.includes(id);
+      let members = has ? d.members.filter((m) => m !== id) : [...d.members, id];
+      if (d.type === "nested") members = [...members].sort((x, y) => pOf(y) - pOf(x));
+      return { ...d, members };
+    });
+  const setType = (type) =>
+    setDraft((d) => {
+      let members = d.members;
+      if (type === "nested") members = [...members].sort((x, y) => pOf(y) - pOf(x));
+      return { ...d, type, members };
+    });
+
+  const canSave =
+    !!draft &&
+    (draft.type === "pairwise"
+      ? draft.members.length === 2 && draft.assoc.value !== "" && isFinite(Number(draft.assoc.value))
+      : draft.members.length >= 2);
+
+  const save = () => {
+    const id = Math.random().toString(36).slice(2);
+    const link =
+      draft.type === "pairwise"
+        ? { id, type: "pairwise", members: draft.members.slice(0, 2), assoc: { input: draft.assoc.input, value: Number(draft.assoc.value) } }
+        : { id, type: draft.type, members: draft.members.slice() };
+    onAdd(link);
+    setDraft(null);
+  };
+
+  return (
+    <section className="kd-card">
+      <div className="kd-card-h kd-th-row">
+        <span>LINKED CONTRACTS &nbsp;·&nbsp; CORRELATED OUTCOMES</span>
+        {!draft && <button className="kd-add" onClick={startDraft}>+ add link</button>}
+      </div>
+
+      {links.length === 0 && !draft && (
+        <div className="kd-note">
+          No links — every contract is treated as independent. Link contracts that concern related events
+          (nested price thresholds, mutually exclusive outcomes, or a correlated pair) so the joint distribution
+          is built correctly instead of as a product of marginals.
+        </div>
+      )}
+
+      {links.map((l) => (
+        <LinkRow key={l.id} link={l} error={linkErrorMap[l.id]} color={colorByRow[l.members[0]]} nameOf={nameOf} pOf={pOf} onRemove={() => onRemove(l.id)} />
+      ))}
+
+      {draft && (
+        <DraftForm
+          draft={draft}
+          linkable={linkable}
+          nameOf={nameOf}
+          pOf={pOf}
+          onToggle={toggleMember}
+          onType={setType}
+          onAssoc={(assoc) => setDraft((d) => ({ ...d, assoc }))}
+          canSave={canSave}
+          onSave={save}
+          onCancel={() => setDraft(null)}
+        />
+      )}
+    </section>
+  );
+}
+
+function LinkRow({ link, error, color, nameOf, pOf, onRemove }) {
+  const valid = !error;
+  let body = null;
+  if (link.type === "pairwise") {
+    const A = link.members[0], B = link.members[1];
+    const a = pOf(A), b = pOf(B);
+    const r = isFinite(a) && isFinite(b) ? derivePairwise(a, b, link.assoc) : { ok: false };
+    const q = r.ok ? pairwiseQuantities(a, b, r.j) : null;
+    body = (
+      <>
+        <div className="kd-link-sub">A = <b>{nameOf(A)}</b> · B = <b>{nameOf(B)}</b> · you set <b>{PW_LABEL[link.assoc.input]} = {Number(link.assoc.value)}</b></div>
+        {q && (
+          <div className="kd-qgrid">
+            {QUANT_ORDER.map((k) => (
+              <span key={k} className={"kd-quant" + (k === link.assoc.input ? " set" : "")}><i>{PW_LABEL[k] || k}</i>{fmtQ(k, q[k])}</span>
+            ))}
+          </div>
+        )}
+      </>
+    );
+  } else if (link.type === "nested") {
+    body = (
+      <div className="kd-link-sub">implication chain: {link.members.map((m, i) => (<span key={m}>{i > 0 ? " ⟹ " : ""}<b>{nameOf(m)}</b> ({fmtPct(pOf(m), 0)})</span>))}</div>
+    );
+  } else {
+    const sum = link.members.reduce((s, m) => s + (pOf(m) || 0), 0);
+    body = (
+      <div className="kd-link-sub">mutually exclusive: {link.members.map((m, i) => (<span key={m}>{i > 0 ? ", " : ""}<b>{nameOf(m)}</b> ({fmtPct(pOf(m), 0)})</span>))} · Σp = {fmtPct(sum, 0)}</div>
+    );
+  }
+  return (
+    <div className="kd-link">
+      <div className="kd-link-head">
+        <span className="kd-link-dot" style={{ background: color }} />
+        <span className="kd-link-type">{link.type}</span>
+        <span className={"kd-badge " + (valid ? "ok" : "bad")}>{valid ? "✓ valid" : "✕ invalid · using independence"}</span>
+        <button className="kd-del" onClick={onRemove}>×</button>
+      </div>
+      {body}
+      {error && <div className="kd-link-err">{error}</div>}
+    </div>
+  );
+}
+
+function DraftForm({ draft, linkable, nameOf, pOf, onToggle, onType, onAssoc, canSave, onSave, onCancel }) {
+  const { type, members } = draft;
+  let preview = null;
+
+  if (type === "pairwise" && members.length === 2) {
+    const a = pOf(members[0]), b = pOf(members[1]);
+    const r = derivePairwise(a, b, draft.assoc);
+    const [rlo, rhi] = r.range || [0, 0];
+    const q = r.ok ? pairwiseQuantities(a, b, r.j) : null;
+    preview = (
+      <div className="kd-draft-prev">
+        <div className="kd-link-sub">A = <b>{nameOf(members[0])}</b> (P={fmtPct(a, 0)}) · B = <b>{nameOf(members[1])}</b> (P={fmtPct(b, 0)})</div>
+        <div className="kd-row">
+          <select className="kd-sel" value={draft.assoc.input} onChange={(e) => onAssoc({ ...draft.assoc, input: e.target.value })}>
+            {Object.keys(PW_LABEL).map((k) => <option key={k} value={k}>{PW_LABEL[k]}</option>)}
+          </select>
+          <input className="kd-num" type="number" step="0.01" value={draft.assoc.value} placeholder="value"
+            onChange={(e) => onAssoc({ ...draft.assoc, value: e.target.value })} />
+        </div>
+        <div className="kd-hint">valid range for {PW_LABEL[draft.assoc.input]}: [{fmtRange(rlo)}, {fmtRange(rhi)}]</div>
+        {q ? (
+          <div className="kd-qgrid">
+            {QUANT_ORDER.map((k) => (
+              <span key={k} className={"kd-quant" + (k === draft.assoc.input ? " set" : "")}><i>{PW_LABEL[k] || k}</i>{fmtQ(k, q[k])}</span>
+            ))}
+          </div>
+        ) : <div className="kd-link-err">{r.error}</div>}
+      </div>
+    );
+  } else if (type === "nested" && members.length >= 2) {
+    const p = members.map(pOf);
+    const k = members.length, table = nestedTable(p);
+    const stairs = [{ label: "none win", p: table[0] }];
+    for (let m = 1; m <= k; m++) stairs.push({ label: m === k ? "all win" : `top ${m} win`, p: table[(1 << m) - 1] });
+    const monotone = p.every((x, i) => i === 0 || p[i - 1] >= p[i] - 1e-9);
+    preview = (
+      <div className="kd-draft-prev">
+        <div className="kd-link-sub">chain (auto-ordered high→low P): {members.map((m, i) => (<span key={m}>{i > 0 ? " ⟹ " : ""}<b>{nameOf(m)}</b> ({fmtPct(pOf(m), 0)})</span>))}</div>
+        <div className="kd-qgrid">
+          {stairs.map((s, i) => <span key={i} className="kd-quant"><i>{s.label}</i>{fmtPct(s.p, 1)}</span>)}
+        </div>
+        {!monotone && <div className="kd-link-err">marginals are not monotonically ordered — this will be rejected.</div>}
+      </div>
+    );
+  } else if (type === "exclusive" && members.length >= 2) {
+    const sum = members.reduce((s, m) => s + (pOf(m) || 0), 0);
+    preview = (
+      <div className="kd-draft-prev">
+        <div className="kd-link-sub">at most one wins: {members.map((m, i) => (<span key={m}>{i > 0 ? ", " : ""}<b>{nameOf(m)}</b> ({fmtPct(pOf(m), 0)})</span>))}</div>
+        <div className={"kd-hint" + (sum > 1 ? " bad" : "")}>Σp = {fmtPct(sum, 1)}{sum > 1 ? " — exceeds 100%, infeasible" : ""} · P(none) = {fmtPct(Math.max(0, 1 - sum), 1)}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="kd-draft">
+      <div className="kd-draft-h">New link</div>
+      <div className="kd-chooser">
+        {linkable.length === 0 ? (
+          <span className="kd-note">All valid contracts are already linked. Remove a link or add contracts.</span>
+        ) : linkable.map((r) => (
+          <label key={r.id} className={"kd-chip" + (members.includes(r.id) ? " on" : "")}>
+            <input type="checkbox" checked={members.includes(r.id)} onChange={() => onToggle(r.id)} />
+            {r.name} <span className="kd-chip-p">{fmtPct(parseFloat(r.prob), 0)}</span>
+          </label>
+        ))}
+      </div>
+      <div className="kd-typesel">
+        {[["pairwise", "Pairwise correlation"], ["nested", "Nested (implication)"], ["exclusive", "Mutually exclusive"]].map(([t, lbl]) => (
+          <button key={t} className={type === t ? "on" : ""} onClick={() => onType(t)} disabled={t === "pairwise" && members.length > 2}>{lbl}</button>
+        ))}
+      </div>
+      {type === "pairwise" && members.length !== 2 && <div className="kd-hint">select exactly 2 contracts for a pairwise link</div>}
+      {type !== "pairwise" && members.length < 2 && <div className="kd-hint">select 2 or more contracts</div>}
+      {preview}
+      <div className="kd-draft-actions">
+        <button className="kd-add" disabled={!canSave} onClick={onSave}>save link</button>
+        <button className="kd-cancel" onClick={onCancel}>cancel</button>
+      </div>
+    </div>
   );
 }
 
@@ -649,6 +908,45 @@ const CSS = `
 .kd-mathbody{font-size:13px;line-height:1.6;color:#c9d1d9;margin-top:12px;}
 .kd-mathbody code{background:#0a0e14;border:1px solid #21262d;border-radius:4px;padding:1px 6px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#58a6ff;}
 .kd-caveat{color:#8b949e;font-size:12px;border-left:2px solid #d29922;padding-left:10px;margin-top:14px;}
+.kd-namewrap{display:flex;align-items:center;gap:6px;min-width:0;}
+.kd-namewrap .kd-name{flex:1;min-width:0;}
+.kd-link-dot{width:8px;height:8px;border-radius:50%;flex:none;display:inline-block;}
+.kd-link{background:#0a0e14;border:1px solid #21262d;border-radius:6px;padding:10px 12px;margin-bottom:10px;}
+.kd-link-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+.kd-link-type{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#8b949e;}
+.kd-badge{font-size:10px;font-family:'IBM Plex Mono',monospace;padding:2px 7px;border-radius:10px;}
+.kd-badge.ok{background:#3fb95022;color:#3fb950;}
+.kd-badge.bad{background:#f8514922;color:#f85149;}
+.kd-link-head .kd-del{margin-left:auto;}
+.kd-link-sub{font-size:12px;color:#c9d1d9;line-height:1.6;}
+.kd-link-sub b{color:#e6edf3;}
+.kd-link-err{font-size:11px;color:#f85149;background:#f8514910;border:1px solid #f8514933;border-radius:5px;padding:7px 9px;margin-top:7px;line-height:1.5;}
+.kd-qgrid{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;}
+.kd-quant{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#8b949e;background:#0d1117;border:1px solid #21262d;border-radius:5px;padding:3px 7px;display:inline-flex;gap:5px;align-items:baseline;}
+.kd-quant i{font-style:normal;color:#6b7785;}
+.kd-quant.set{border-color:#1f6feb;background:#1f6feb18;color:#58a6ff;}
+.kd-quant.set i{color:#58a6ff;}
+.kd-draft{background:#0a0e14;border:1px dashed #2a3441;border-radius:6px;padding:12px;margin-top:6px;}
+.kd-draft-h{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:1px;color:#8b949e;margin-bottom:10px;}
+.kd-chooser{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;}
+.kd-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#c9d1d9;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:5px 9px;cursor:pointer;}
+.kd-chip.on{border-color:#1f6feb;background:#1f6feb18;color:#58a6ff;}
+.kd-chip input{accent-color:#58a6ff;}
+.kd-chip-p{font-family:'IBM Plex Mono',monospace;font-size:10px;color:#6b7785;}
+.kd-typesel{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;}
+.kd-typesel button{background:#0d1117;border:1px solid #2a3441;color:#8b949e;border-radius:6px;padding:6px 10px;font-size:11px;cursor:pointer;font-family:inherit;}
+.kd-typesel button.on{background:#1f6feb22;border-color:#1f6feb;color:#58a6ff;}
+.kd-typesel button:disabled{opacity:.4;cursor:not-allowed;}
+.kd-hint{font-size:11px;color:#6b7785;font-family:'IBM Plex Mono',monospace;margin-top:6px;}
+.kd-hint.bad{color:#f85149;}
+.kd-draft-prev{margin-top:8px;border-top:1px solid #161b22;padding-top:10px;}
+.kd-draft-prev .kd-row{display:flex;gap:8px;margin-top:8px;align-items:center;}
+.kd-sel{background:#0d1117;border:1px solid #21262d;color:#c9d1d9;border-radius:5px;padding:5px 7px;font-family:inherit;font-size:12px;outline:none;}
+.kd-sel:focus{border-color:#1f6feb;}
+.kd-draft-prev .kd-num{width:110px;}
+.kd-draft-actions{display:flex;gap:8px;margin-top:12px;}
+.kd-add:disabled{opacity:.4;cursor:not-allowed;}
+.kd-cancel{background:none;border:1px solid #2a3441;color:#8b949e;border-radius:6px;padding:4px 12px;font-size:11px;cursor:pointer;font-family:inherit;}
 @media(max-width:760px){.kd-grid{grid-template-columns:1fr;}
 .kd-tr{grid-template-columns:1.5fr .7fr .7fr .7fr .9fr .6fr .4fr;}
 .kd-tr span:nth-child(6),.kd-tr span:nth-child(7),.kd-thead span:nth-child(6),.kd-thead span:nth-child(7){display:none;}}

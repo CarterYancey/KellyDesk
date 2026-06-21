@@ -14,7 +14,7 @@ Contracts B and C have the same P(win), but C is much cheaper. It makes sense to
 
 3. The graph under the 2^n enumeration Risk of Ruin percentage is uninterpretable. I want to see an actual probability density function graph with portfolio size on the X-axis.
 
-4. Come up with some way to link correlated contracts. In the above example, ContractA cannot be True and ContractD false (although ContractD can be True and ContractA false). 
+4. ~~Come up with some way to link correlated contracts. In the above example, ContractA cannot be True and ContractD false (although ContractD can be True and ContractA false).~~ **Done** — the "Linked Contracts" panel lets you declare *nested* (implication chains, e.g. ContractA ⟹ ContractD), *mutually exclusive*, or *pairwise* (conditional / correlation / odds-ratio) relationships. The declared joint replaces the independence product in `prob[s]`; the solver, risk metrics, and 2ⁿ enumeration all consume it unchanged. Infeasible inputs are rejected against the Fréchet–Hoeffding bounds. See `src/joint.js`.
 
 5. `Edge` should not be in raw cents
 

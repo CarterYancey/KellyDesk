@@ -85,7 +85,15 @@ The median terminal wealth after 400 rounds indicates the compounding trajectory
 
 ## Assumptions and Limitations
 
-**Independence.** The most critical assumption is that all contracts in the portfolio resolve independently. If two contracts concern related events — the same political outcome, correlated markets, or any shared underlying uncertainty — the product-of-marginals formula for *P*(*S*) is wrong. Positively correlated contracts make the all-lose tail more likely than the independent model predicts, meaning the tool understates ruin risk. Negatively correlated contracts (natural hedges) make it safer, meaning the tool overstates ruin risk and may under-allocate. If your contracts are correlated, the optimizer needs the full joint probability distribution, not just individual *p* values.
+**Independence (by default).** Unless you say otherwise, all contracts resolve independently and *P*(*S*) is the product of marginals. If two contracts concern related events — the same political outcome, correlated markets, or any shared underlying uncertainty — that product is wrong. Positively correlated contracts make the all-lose tail more likely than the independent model predicts (the tool would understate ruin risk); natural hedges make it safer (overstating ruin risk, under-allocating).
+
+**Declaring correlations.** The **Linked Contracts** panel removes the independence assumption for any group of contracts you link. Three relationship types are supported:
+
+- **Nested / implication chain** — when one event logically implies another (e.g. "price > $7" ⟹ "price > $5"). The marginals alone pin down the joint: only the *k*+1 "staircase" outcomes are possible.
+- **Mutually exclusive** — at most one member can win; outcomes with two or more winners have probability zero.
+- **Pairwise correlation** — for a pair, supply any one of *P*(*A*\|*B*), *P*(*B*\|*A*), *P*(*A*\|¬*B*), *P*(*B*\|¬*A*), correlation *ρ*, or odds ratio *θ*; the joint *P*(*A*∧*B*) is solved from it and shown alongside all six derived quantities.
+
+Each link's joint replaces the independence product over its members when building *P*(*S*); the solver, risk metrics, and the exact 2ⁿ enumeration all consume the corrected distribution with no change to the optimization math. Inputs that imply a logically impossible joint are rejected against the Fréchet–Hoeffding bounds with a message naming the valid range, and the offending link falls back to independence until corrected. A contract may belong to at most one link. (Implementation: `src/joint.js`.)
 
 **Probability estimation.** Kelly criterion is exquisitely sensitive to the accuracy of your *p* estimates. A systematic overestimate of 5 percentage points in all your *p* values will cause the solver to recommend significantly larger positions than warranted, with correspondingly higher actual (as opposed to estimated) ruin probability. The fractional-Kelly reduction exists largely to hedge against overconfident probability estimates.
 
